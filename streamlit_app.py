@@ -8,6 +8,7 @@ import io
 import math
 from urllib.parse import quote
 from typing import Tuple, Dict, Any
+import datetime # Importado para pegar o ano atual
 
 # ============================
 # CONSTANTES GLOBAIS
@@ -18,7 +19,7 @@ COR_SECUNDARIA = "#7BBF4F"
 # Custos
 TAXA_FIXA_CARTAO = 2286.00
 CUSTO_CARENCIA_FINANC = 1350.00
-DEGRADACAO_PAINEL_ANUAL = 0.005 # 0.5% de perda de eficiência ao ano
+DEGRADACAO_PAINEL_ANUAL = 0.005
 
 # Mapa de escalonamento do Fio B (Lei 14.300)
 FIO_B_PERCENT_MAP = {
@@ -28,7 +29,6 @@ FIO_B_PERCENT_MAP = {
     2026: 60.0,
     2027: 75.0,
     2028: 90.0,
-    # De 2029 em diante, é 100%
 }
 
 # Mapa do Custo de Disponibilidade (Res. 1000 ANEEL)
@@ -49,22 +49,45 @@ CUSTOM_CSS = f"""
         border-color: {COR_PRIMARIA};
     }}
     .st-emotion-cache-1v0mfe2.e10yg2x71:hover {{
-        background-color: #2E5916; /* Um tom de verde mais escuro no hover */
+        background-color: #2E5916;
         border-color: #2E5916;
+    }}
+    /* MUDANÇA (R8): Diminui fonte do Resumo da Projeção */
+    .metric-container-markdown h4 {{
+        font-size: 1.1rem;
+        font-weight: 400;
+        color: #555;
+    }}
+    .metric-container-markdown h3 {{
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: #000;
     }}
 </style>
 """
 
 # ============================
-# FUNÇÕES DE CALLBACK (Sincronia dos sliders)
+# FUNÇÃO DE FORMATAÇÃO DE MOEDA (R6)
 # ============================
-def sync_slider_2_from_1():
-    """Se o slider 1 mudar, atualiza o valor do slider 2."""
-    if "autoconsumo_slider_1" in st.session_state:
-        st.session_state.autoconsumo_slider_2 = st.session_state.autoconsumo_slider_1
+def format_currency_brl(valor: float) -> str:
+    """
+    Formata um float para o padrão de moeda brasileiro (R$ 1.234,56).
+    """
+    if valor is None:
+        valor = 0.0
+    # Formato padrão US: 1,234.56
+    formatted_str = f"{valor:,.2f}"
+    # Troca ',' por 'v' (temp) -> 1v234.56
+    # Troca '.' por ',' -> 1v234,56
+    # Troca 'v' por '.' -> 1.234,56
+    formatted_str_brl = formatted_str.replace(",", "v").replace(".", ",").replace("v", ".")
+    return f"R$ {formatted_str_brl}"
 
+# ============================
+# FUNÇÕES DE CALLBACK
+# ============================
 def sync_slider_1_from_2():
-    """Se o slider 2 mudar, atualiza o valor do slider 1."""
+    """Se o slider 2 (único) mudar, atualiza o valor no state."""
     if "autoconsumo_slider_2" in st.session_state:
         st.session_state.autoconsumo_slider_1 = st.session_state.autoconsumo_slider_2
 
@@ -114,15 +137,18 @@ def calcular_fluxo_caixa(
     ano_inicio_projeto: int,
     inflacao_energia: float,
     degradacao_anual: float,
-    kwh_minimo_disponibilidade: int
+    kwh_minimo_disponibilidade: int,
+    taxa_iluminacao_publica: float # MUDANÇA (R2)
 ) -> pd.DataFrame:
     """
-    Inclui o Custo de Disponibilidade no cálculo do fluxo de caixa.
+    Inclui o Custo de Disponibilidade e Iluminação Pública no fluxo.
     """
     lista_anos = list(range(1, anos + 1))
     
     fluxo_caixa_acumulado_list = []
     gasto_sem_solar_acumulado_list = []
+    fluxo_fmt_list = []
+    gasto_fmt_list = []
     
     fluxo_acumulado_com_solar = -valor_final_investimento
     gasto_acumulado_sem_solar = 0.0
@@ -133,42 +159,51 @@ def calcular_fluxo_caixa(
         ano_calendario = ano_inicio_projeto + (ano - 1)
         percent_fio_b_a_pagar = FIO_B_PERCENT_MAP.get(ano_calendario, 100.0)
         
+        # Inflação afeta a tarifa E a taxa de iluminação
         tarifa_kwh_inflacionada = tarifa_kwh_inicial * ((1 + inflacao_energia) ** (ano - 1))
+        taxa_iluminacao_inflacionada = taxa_iluminacao_publica * ((1 + inflacao_energia) ** (ano - 1))
+        
         geracao_mensal_degradada = geracao_mensal_inicial * ((1 - degradacao_anual) ** (ano - 1))
 
         # --- 1. Calcular Gasto SEM Solar (Linha Vermelha) ---
-        gasto_anual_sem_solar = (kwh_mensal_consumo * 12 * tarifa_kwh_inflacionada)
+        gasto_anual_sem_solar = (kwh_mensal_consumo * 12 * tarifa_kwh_inflacionada) + (taxa_iluminacao_inflacionada * 12)
         gasto_acumulado_sem_solar += gasto_anual_sem_solar
         gasto_sem_solar_acumulado_list.append(gasto_acumulado_sem_solar)
+        gasto_fmt_list.append(format_currency_brl(gasto_acumulado_sem_solar))
 
         # --- 2. Calcular Economia LÍQUIDA COM Solar (Linha Verde) ---
         gasto_antigo_anual = gasto_anual_sem_solar
         energia_excedente = geracao_mensal_degradada * (1 - autoconsumo_frac)
         
-        # Custo do Fio B (pago sobre a energia EXCEDENTE)
+        # Custo Fio B
         valor_tarifa_fio_b_estimado_kwh = tarifa_kwh_inflacionada * (fracao_fio_b_percent / 100)
         custo_fio_b_anual = (
             energia_excedente * valor_tarifa_fio_b_estimado_kwh * (percent_fio_b_a_pagar / 100)
         ) * 12
 
-        # Custo de Disponibilidade (Taxa Mínima)
+        # Custo Disponibilidade
         custo_disponibilidade_anual = (kwh_minimo_disponibilidade * tarifa_kwh_inflacionada) * 12
-
-        gasto_novo_anual = custo_fio_b_anual + custo_disponibilidade_anual
+        
+        # MUDANÇA (R2): Taxa de iluminação é um custo fixo que permanece
+        gasto_novo_anual = custo_fio_b_anual + custo_disponibilidade_anual + (taxa_iluminacao_inflacionada * 12)
+        
         economia_liquida_anual = max(0, gasto_antigo_anual - gasto_novo_anual)
 
         fluxo_acumulado_com_solar += economia_liquida_anual
         fluxo_caixa_acumulado_list.append(fluxo_acumulado_com_solar)
+        fluxo_fmt_list.append(format_currency_brl(fluxo_acumulado_com_solar))
 
     return pd.DataFrame({
         "Ano": lista_anos,
         "Gasto acumulado sem solar (R$)": gasto_sem_solar_acumulado_list,
-        "Fluxo de caixa acumulado com solar (R$)": fluxo_caixa_acumulado_list
+        "Fluxo de caixa acumulado com solar (R$)": fluxo_caixa_acumulado_list,
+        "Gasto Formatado": gasto_fmt_list,
+        "Fluxo Formatado": fluxo_fmt_list,
     })
 
 
 def gerar_pdf_proposta(dados: Dict[str, Any]) -> bytes:
-    """Adiciona Tipo de Conexão e Custo Disponibilidade ao PDF."""
+    """MUDANÇA (R6): Corrigida formatação de moeda em todos os campos."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
@@ -190,6 +225,8 @@ def gerar_pdf_proposta(dados: Dict[str, Any]) -> bytes:
     c.drawString(2 * cm, y, f"Tipo de Conexão: {dados['tipo_conexao']}")
     y -= 0.4 * cm
     c.drawString(2 * cm, y, f"Consumo alvo: {dados['kwh_mensal']:.0f} kWh/mês")
+    y -= 0.4 * cm
+    c.drawString(2 * cm, y, f"Taxa de Iluminação Pública: {format_currency_brl(dados['taxa_iluminacao_publica'])}") # (R2)
     y -= 0.8 * cm
 
     # --- Resumo do Sistema ---
@@ -212,15 +249,17 @@ def gerar_pdf_proposta(dados: Dict[str, Any]) -> bytes:
         c.setFont("Helvetica", 11)
         c.drawString(2 * cm, y, f"Autoconsumo considerado: {dados['autoconsumo_percent']:.0f}%")
         y -= 0.4 * cm
-        c.drawString(2 * cm, y, f"Custo de Disponibilidade: R$ {dados['custo_disponibilidade_mensal']:,.2f}")
+        c.drawString(2 * cm, y, f"Custo de Disponibilidade: {format_currency_brl(dados['custo_disponibilidade_mensal'])}")
         y -= 0.4 * cm
-        c.drawString(2 * cm, y, f"Custo Fio B (Ano {dados['ano_inicio_projeto']}): R$ {dados['custo_fio_b_mensal']:,.2f}")
+        c.drawString(2 * cm, y, f"Custo Fio B (Ano {dados['ano_inicio_projeto']}): {format_currency_brl(dados['custo_fio_b_mensal'])}")
         y -= 0.4 * cm
-        c.drawString(2 * cm, y, f"Nova Fatura Mínima Estimada: R$ {dados['custo_disponibilidade_mensal'] + dados['custo_fio_b_mensal']:,.2f}")
+        # MUDANÇA (R6): Correção na formatação
+        nova_fatura = dados['custo_disponibilidade_mensal'] + dados['custo_fio_b_mensal'] + dados['taxa_iluminacao_publica']
+        c.drawString(2 * cm, y, f"Nova Fatura Estimada (Disp + Fio B + Ilum.): {format_currency_brl(nova_fatura)}")
         y -= 0.4 * cm
-        c.drawString(2 * cm, y, f"Economia mensal líquida (Ano 1): R$ {dados['economia_mensal']:,.2f}")
+        c.drawString(2 * cm, y, f"Economia mensal líquida (Ano 1): {format_currency_brl(dados['economia_mensal'])}")
         y -= 0.4 * cm
-        c.drawString(2 * cm, y, f"Economia acumulada em 25 anos: R$ {dados['economia_25_anos']:,.2f}")
+        c.drawString(2 * cm, y, f"Economia acumulada em 25 anos: {format_currency_brl(dados['economia_25_anos'])}")
         y -= 0.8 * cm
 
     # --- Investimento ---
@@ -228,14 +267,15 @@ def gerar_pdf_proposta(dados: Dict[str, Any]) -> bytes:
     c.drawString(2 * cm, y, "Investimento e Condições Comerciais")
     y -= 0.6 * cm
     c.setFont("Helvetica", 11)
-    c.drawString(2 * cm, y, f"Valor base do sistema: R$ {dados['valor_sistema_base']:,.2f}")
+    # MUDANÇA (R6): Correção na formatação
+    c.drawString(2 * cm, y, f"Valor base do sistema: {format_currency_brl(dados['valor_sistema_base'])}")
     y -= 0.4 * cm
     c.drawString(2 * cm, y, f"Modalidade de pagamento: {dados['modalidade']}")
     y -= 0.4 * cm
-    c.drawString(2 * cm, y, f"Valor final da proposta: R$ {dados['valor_final']:,.2f}")
+    c.drawString(2 * cm, y, f"Valor final da proposta: {format_currency_brl(dados['valor_final'])}")
     y -= 0.4 * cm
     if dados.get("parcela_mensal") is not None:
-        c.drawString(2 * cm, y, f"Parcela mensal estimada: R$ {dados['parcela_mensal']:,.2f}")
+        c.drawString(2 * cm, y, f"Parcela mensal estimada: {format_currency_brl(dados['parcela_mensal'])}")
         y -= 0.4 * cm
     y -= 0.4 * cm
     
@@ -250,22 +290,26 @@ def gerar_pdf_proposta(dados: Dict[str, Any]) -> bytes:
 # ============================
 
 def renderizar_cabecalho():
-    """Renderiza o cabeçalho da página."""
+    """MUDANÇA (R1): Adiciona link no Instagram e texto descritivo."""
     st.markdown(
         f"""
         <h1 style="text-align:center; color:{COR_PRIMARIA}; margin-bottom:0;">
             Brasil Enertech
         </h1>
-        <h3 style="text-align:center; color:#444; margin-top:4px;">
+        <h3 style="text-align:center; color:#444; margin-top:4px; margin-bottom:4px;">
             Gerador de Propostas
         </h3>
+        <p style="text-align:center; color:#555; margin-bottom:10px;">
+            Dimensione seu sistema de forma simples e prática.<br>
+            Siga-nos no Instagram: <a href="https://www.instagram.com/brasilenertech" target="_blank"><b>@brasilenertech</b></a>
+        </p>
         """,
         unsafe_allow_html=True
     )
     st.markdown("---")
 
 def renderizar_entradas_cliente() -> Dict[str, Any]:
-    """Adiciona 'Tipo de Conexão'."""
+    """MUDANÇA (R1, R2, R7): Remove slider 1, adiciona Iluminação Pública, padrão Monofásico."""
     with st.container(border=True):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -276,26 +320,25 @@ def renderizar_entradas_cliente() -> Dict[str, Any]:
             kwh_mensal = st.number_input("Consumo alvo (kWh/mês)", min_value=50.0, step=10.0, value=800.0)
         with col3:
             tarifa_kwh = st.number_input("Tarifa de energia (R$/kWh)", min_value=0.5, max_value=3.0, value=1.10, step=0.05)
-            
+
         col4, col5 = st.columns(2)
         with col4:
-            # Novo campo 'Tipo de Conexão'
+            # MUDANÇA (R7): Padrão index=0 (Monofásico)
             tipo_conexao = st.selectbox(
                 "Tipo de Conexão",
                 options=["Monofásico", "Bifásico", "Trifásico"],
-                index=2, # Padrão Trifásico (100 kWh)
+                index=0, 
                 help="Define o Custo de Disponibilidade (taxa mínima) - Monofásico: 30 kWh, Bifásico: 50 kWh, Trifásico: 100 kWh"
             )
         with col5:
-            # Slider 1
-            st.slider(
-                "Autoconsumo instantâneo (%)", 
-                min_value=10, max_value=100, 
-                step=5,
-                help="Qual % da energia gerada é consumida NA HORA? O restante é injetado e pagará o Fio B.",
-                key="autoconsumo_slider_1",
-                on_change=sync_slider_2_from_1
+            # MUDANÇA (R2): Adiciona campo de Iluminação Pública
+            taxa_iluminacao_publica = st.number_input(
+                "Taxa de Iluminação Pública (R$)",
+                min_value=0.0, value=30.0, step=5.0,
+                help="Valor da 'Cosip' ou 'CIP' que vem na sua conta. Este valor não muda com a energia solar."
             )
+        
+        # MUDANÇA (R1): Slider de autoconsumo desta seção foi REMOVIDO.
 
     return {
         "cliente": nome_cliente,
@@ -303,12 +346,13 @@ def renderizar_entradas_cliente() -> Dict[str, Any]:
         "email": email,
         "kwh_mensal": kwh_mensal,
         "tarifa_kwh": tarifa_kwh,
-        "autoconsumo_percent": st.session_state.autoconsumo_slider_1,
-        "tipo_conexao": tipo_conexao
+        "autoconsumo_percent": st.session_state.autoconsumo_slider_1, 
+        "tipo_conexao": tipo_conexao,
+        "taxa_iluminacao_publica": taxa_iluminacao_publica # Novo
     }
 
 def renderizar_configuracoes_tecnicas() -> Dict[str, Any]:
-    """Renderiza os inputs de configurações técnicas."""
+    """MUDANÇA (R3): Ano de Conexão começa no ano atual."""
     with st.container(border=True):
         st.subheader("Configurações Técnicas e de Tarifa")
         
@@ -334,10 +378,14 @@ def renderizar_configuracoes_tecnicas() -> Dict[str, Any]:
                 help="Estimativa da % da tarifa total que corresponde ao Fio B. (Média nacional: 28%)"
             )
         with col7:
+            # MUDANÇA (R3): Pega o ano atual e o usa como padrão
+            ano_atual = datetime.datetime.now().year
+            anos_disponiveis = list(range(ano_atual, 2030)) # Lista de 2024 até 2029
+            
             ano_inicio_projeto = st.selectbox(
                 "Ano de Conexão (Lei 14.300)",
-                options=[2024, 2025, 2026, 2027, 2028, 2029],
-                index=0,
+                options=anos_disponiveis,
+                index=0, 
                 help="Ano de entrada no sistema de compensação. Define a 'escada' de pagamento do Fio B."
             )
 
@@ -358,7 +406,7 @@ def renderizar_dimensionamento(
     pot_painel_w: int,
     valor_kwp: float
 ) -> Dict[str, Any]:
-    """CORREÇÃO (V5.1): Layout dos botões de ajuste com colunas aninhadas."""
+    """Layout V5.1 mantido, pois é limpo."""
     
     perdas_frac = perdas_percent / 100
     
@@ -387,11 +435,9 @@ def renderizar_dimensionamento(
     with st.container(border=True):
         st.subheader("Dimensionamento do Sistema")
         
-        # Colunas principais (Botões | Texto)
         col_btn_area, col_text_area = st.columns([1, 1])
         
         with col_btn_area:
-            # Colunas aninhadas para os botões
             btn_cols = st.columns(3)
             with btn_cols[0]:
                 st.button("➖", on_click=diminuir_paineis, use_container_width=True, help="Diminuir 1 painel")
@@ -401,7 +447,6 @@ def renderizar_dimensionamento(
                 st.button("Reset", on_click=resetar_paineis, use_container_width=True, help="Voltar à recomendação")
 
         with col_text_area:
-            # O 'style' diminui o espaço superior do texto para alinhar melhor
             st.markdown(f"""
             <div style='margin-top: -8px;'> 
                 **Qtd. atual: {st.session_state.qtd_paineis} painéis**
@@ -410,7 +455,6 @@ def renderizar_dimensionamento(
             </div>
             """, unsafe_allow_html=True)
 
-        # Recalcula tudo com a quantidade final
         qtd_final, kwp_total, geracao_mensal = dimensionar_sistema(
             kwh_mensal, hsp, perdas_frac, pot_painel_w, st.session_state.qtd_paineis
         )
@@ -423,7 +467,7 @@ def renderizar_dimensionamento(
         with col_d2:
             st.metric("Geração mensal (kWh)", f"{geracao_mensal:,.0f}")
         with col_d3:
-            st.metric("Valor base do sistema", f"R$ {valor_sistema_base:,.2f}")
+            st.metric("Valor base do sistema", format_currency_brl(valor_sistema_base))
         
         st.caption(
             f"ℹ️ A geração mensal ({geracao_mensal:,.0f} kWh) pode ser maior que o consumo alvo ({kwh_mensal:,.0f} kWh) "
@@ -443,18 +487,18 @@ def renderizar_simulacao_economia(
     fracao_fio_b_percent: float,
     ano_inicio_projeto: int,
     kwh_mensal_consumo: float,
-    kwh_minimo_disponibilidade: int
+    kwh_minimo_disponibilidade: int,
+    taxa_iluminacao_publica: float
 ) -> Dict[str, Any]:
-    """CORREÇÃO (V5.1): Revertendo para st.metric para corrigir layout e sobreposição."""
+    """MUDANÇA (V7.1): Layout 2x2 para corrigir sobreposição de 4 colunas."""
     with st.container(border=True):
         st.subheader("Simulação de Economia (Estimativa Ano 1)")
 
-        # Slider 2 (sincronizado)
         st.slider(
             "Autoconsumo instantâneo (%)", 
             min_value=10, max_value=100, 
             step=5,
-            help="Mude aqui para ver o impacto no Fio B. Está sincronizado com o slider do topo.",
+            help="Mude aqui para ver o impacto no Fio B.",
             key="autoconsumo_slider_2",
             on_change=sync_slider_1_from_2
         )
@@ -464,44 +508,63 @@ def renderizar_simulacao_economia(
 
         # --- Cálculo da economia do ANO 1 ---
         percentual_pagamento_ano1 = FIO_B_PERCENT_MAP.get(ano_inicio_projeto, 100.0)
-        gasto_antigo_mensal = kwh_mensal_consumo * tarifa_kwh
+        gasto_antigo_mensal = (kwh_mensal_consumo * tarifa_kwh) + taxa_iluminacao_publica
+        
         energia_excedente = geracao_mensal * (1 - autoconsumo_frac)
         valor_tarifa_fio_b_estimado_kwh = tarifa_kwh * (fracao_fio_b_percent / 100)
         custo_fio_b_mensal = (
             energia_excedente * valor_tarifa_fio_b_estimado_kwh * (percentual_pagamento_ano1 / 100)
         )
         custo_disponibilidade_mensal = kwh_minimo_disponibilidade * tarifa_kwh
-        gasto_novo_mensal = custo_disponibilidade_mensal + custo_fio_b_mensal
+        
+        gasto_novo_mensal = custo_disponibilidade_mensal + custo_fio_b_mensal + taxa_iluminacao_publica
+        
         economia_mensal_total = max(0, gasto_antigo_mensal - gasto_novo_mensal)
         economia_anual = economia_mensal_total * 12
         
         st.markdown("---")
         
-        # Voltamos ao st.metric. É mais limpo e responsivo.
-        col1, col2, col3 = st.columns(3)
+        # MUDANÇA (V7.1): Layout novo (2 colunas principais)
+        col1, col2 = st.columns(2)
         with col1:
             st.metric(
-                label="Economia Líquida (Mês)", 
-                value=f"R$ {economia_mensal_total:,.2f}"
+                label="✅ Economia Líquida (Mês)", 
+                value=format_currency_brl(economia_mensal_total)
             )
         with col2:
             st.metric(
-                label="Custo Fio B (Mês)", 
-                value=f"R$ {custo_fio_b_mensal:,.2f}",
-                delta_color="off" # Neutro
+                label="🧾 Nova Fatura Estimada (Mês)", 
+                value=format_currency_brl(gasto_novo_mensal),
+                delta_color="off"
             )
+        
+        st.markdown("<br>", unsafe_allow_html=True) # Adiciona um espaço
+        st.markdown("##### Detalhamento da Nova Fatura:")
+
+        # MUDANÇA (V7.1): 3 colunas para o detalhamento (têm mais espaço)
+        col3, col4, col5 = st.columns(3)
         with col3:
             st.metric(
+                label="Custo Fio B", 
+                value=format_currency_brl(custo_fio_b_mensal),
+                delta_color="off"
+            )
+        with col4:
+            st.metric(
                 label="Custo Disponibilidade", 
-                value=f"R$ {custo_disponibilidade_mensal:,.2f}",
-                delta_color="off" # Neutro
+                value=format_currency_brl(custo_disponibilidade_mensal),
+                delta_color="off"
+            )
+        with col5:
+            st.metric(
+                label="Iluminação Pública", 
+                value=format_currency_brl(taxa_iluminacao_publica),
+                delta_color="off"
             )
             
-        st.info(f"Sua nova fatura mínima estimada (Ano 1) será de **R$ {gasto_novo_mensal:,.2f} /mês** (Custo Fio B + Disponibilidade).")
-
         with st.expander("Ver detalhes do cálculo (Ano 1)"):
-            st.markdown(f"**Gasto antigo (sem solar):** `R$ {gasto_antigo_mensal:,.2f}`")
-            st.markdown(f"**Gasto novo (com solar):** `R$ {gasto_novo_mensal:,.2f}`")
+            st.markdown(f"**Gasto antigo (sem solar):** `{format_currency_brl(gasto_antigo_mensal)}`")
+            st.markdown(f"**Gasto novo (com solar):** `{format_currency_brl(gasto_novo_mensal)}`")
             st.markdown("---")
             st.markdown(f"**Energia autoconsumida:** `{geracao_mensal * autoconsumo_frac:,.0f} kWh`")
             st.markdown(f"**Energia injetada (excedente):** `{energia_excedente:,.0f} kWh`")
@@ -516,8 +579,11 @@ def renderizar_simulacao_economia(
         "autoconsumo_percent": autoconsumo_percent
     }
 
-def renderizar_pagamento(valor_sistema_base: float) -> Dict[str, Any]:
-    """Renderiza as modalidades de pagamento."""
+def renderizar_pagamento(
+    valor_sistema_base: float,
+    resultados_eco: Dict[str, Any]
+) -> Dict[str, Any]:
+    """MUDANÇA (R4, R5, R7, R13): Adiciona campos PF/PJ com formato e keys."""
     with st.container(border=True):
         st.subheader("Modalidades de Pagamento")
 
@@ -528,12 +594,47 @@ def renderizar_pagamento(valor_sistema_base: float) -> Dict[str, Any]:
 
         valor_final = valor_sistema_base
         parcela_mensal = None
+        dados_cliente_fin = {} # (R7)
 
         if modalidade.startswith("À vista"):
             valor_final = valor_sistema_base * 0.95
-            st.success(f"**Valor Final:** R$ {valor_final:,.2f}")
+            st.success(f"**Valor Final:** {format_currency_brl(valor_final)}")
 
         elif modalidade == "Financiamento":
+            st.info("ℹ️ Para agilizar sua análise de crédito, preencha os dados abaixo.")
+            
+            tipo_cliente = st.radio(
+                "Tipo de Cliente", 
+                ["Pessoa Física (PF)", "Pessoa Jurídica (PJ)"], 
+                key="tipo_cliente_fin", 
+                horizontal=True
+            )
+            
+            if tipo_cliente == "Pessoa Física (PF)":
+                col_pf1, col_pf2 = st.columns(2)
+                with col_pf1:
+                    # MUDANÇA (R5, R7): Placeholder e Key
+                    cpf = st.text_input("CPF", placeholder="123.456.789-00", key="dado_financeiro_pf")
+                with col_pf2:
+                    # MUDANÇA (R4): Formato
+                    data_nasc = st.date_input("Data de Nascimento", format="DD/MM/YYYY")
+                endereco_pf = st.text_input("Endereço Completo (PF)", placeholder="Rua, Número, Bairro, CEP, Cidade - UF", key="endereco_pf")
+                dados_cliente_fin = {"cpf": cpf, "data_nasc": data_nasc, "endereco": endereco_pf}
+            
+            else: # Pessoa Jurídica (PJ)
+                col_pj1, col_pj2 = st.columns(2)
+                with col_pj1:
+                    # MUDANÇA (R5, R7): Placeholder e Key
+                    cnpj = st.text_input("CNPJ", placeholder="12.345.678/0001-99", key="dado_financeiro_pj")
+                with col_pj2:
+                    # MUDANÇA (R4): Formato
+                    data_abertura = st.date_input("Data de Abertura da Empresa", format="DD/MM/YYYY")
+                endereco_pj = st.text_input("Endereço Completo (PJ)", placeholder="Rua, Número, Bairro, CEP, Cidade - UF", key="endereco_pj")
+                ramo_pj = st.text_input("Atividade (Ramo)", placeholder="Ex: Comércio Varejista, Serviços, etc.", key="ramo_pj")
+                dados_cliente_fin = {"cnpj": cnpj, "data_abertura": data_abertura, "endereco": endereco_pj, "ramo": ramo_pj}
+                
+            st.markdown("---")
+            
             col_f1, col_f2, col_f3 = st.columns(3)
             with col_f1:
                 meses = st.selectbox("Número de parcelas", [36, 48, 60, 72], index=1)
@@ -549,12 +650,11 @@ def renderizar_pagamento(valor_sistema_base: float) -> Dict[str, Any]:
                 parcela_mensal = (valor_financiado * i) / (1 - (1 + i) ** (-meses))
             else:
                 parcela_mensal = valor_financiado / meses
-
             valor_final = parcela_mensal * meses
 
-            st.info(f"Valor a ser financiado (com carência): R$ {valor_financiado:,.2f}")
-            st.success(f"**Parcela mensal:** R$ {parcela_mensal:,.2f}")
-            st.caption(f"Valor total ao final do financiamento: R$ {valor_final:,.2f}")
+            st.info(f"Valor a ser financiado (com carência): {format_currency_brl(valor_financiado)}")
+            st.success(f"**Parcela mensal:** {format_currency_brl(parcela_mensal)}")
+            st.caption(f"Valor total ao final do financiamento: {format_currency_brl(valor_final)}")
 
         elif modalidade == "Cartão de crédito":
             col_c1, col_c2 = st.columns(2)
@@ -570,17 +670,41 @@ def renderizar_pagamento(valor_sistema_base: float) -> Dict[str, Any]:
                 parcela_mensal = (valor_com_taxa_fixa * i) / (1 - (1 + i) ** (-parcelas_cartao))
             else:
                 parcela_mensal = valor_com_taxa_fixa / parcelas_cartao
-            
             valor_final = parcela_mensal * parcelas_cartao
 
-            st.info(f"Valor base com taxa fixa: R$ {valor_com_taxa_fixa:,.2f}")
-            st.success(f"**Parcela aproximada:** R$ {parcela_mensal:,.2f}")
-            st.caption(f"Valor total no cartão: R$ {valor_final:,.2f}")
+            st.info(f"Valor base com taxa fixa: {format_currency_brl(valor_com_taxa_fixa)}")
+            st.success(f"**Parcela aproximada:** {format_currency_brl(parcela_mensal)}")
+            st.caption(f"Valor total no cartão: {format_currency_brl(valor_final)}")
+        
+        
+        # MUDANÇA (R13): Tabela/Balanço Comparativo
+        if parcela_mensal is not None:
+            st.markdown("---")
+            st.subheader("Balanço Financeiro (Estimativa Ano 1)")
+            
+            economia_liquida = resultados_eco.get('economia_mensal', 0)
+            resultado_final = economia_liquida - parcela_mensal
+            
+            col_bal1, col_bal2, col_bal3 = st.columns(3)
+            with col_bal1:
+                st.metric("Sua Economia Mensal", format_currency_brl(economia_liquida))
+            with col_bal2:
+                st.metric("Sua Parcela Mensal", format_currency_brl(parcela_mensal))
+            with col_bal3:
+                st.metric("Resultado (Economia - Parcela)", 
+                           format_currency_brl(resultado_final),
+                           delta_color="normal" if resultado_final > 0 else "inverse")
+            
+            if resultado_final > 0:
+                st.success(f"O sistema se 'paga' desde a primeira parcela, gerando uma folga de {format_currency_brl(resultado_final)} por mês.")
+            else:
+                st.warning(f"Sua parcela será {format_currency_brl(abs(resultado_final))} maior que sua economia inicial. A inflação energética deve compensar isso nos próximos anos.")
 
     return {
         "modalidade": modalidade,
         "valor_final": valor_final,
-        "parcela_mensal": parcela_mensal
+        "parcela_mensal": parcela_mensal,
+        "dados_cliente_fin": dados_cliente_fin # (R7)
     }
 
 def renderizar_projecao_financeira(
@@ -591,9 +715,10 @@ def renderizar_projecao_financeira(
     autoconsumo_percent: int,
     fracao_fio_b_percent: float,
     ano_inicio_projeto: int,
-    kwh_minimo_disponibilidade: int
+    kwh_minimo_disponibilidade: int,
+    taxa_iluminacao_publica: float # MUDANÇA (R2)
 ):
-    """Adiciona métricas de resumo (KPIs) abaixo do gráfico."""
+    """MUDANÇA (R8, R10, R11): Payback em meses, tooltips R$ e fontes menores."""
     with st.container(border=True):
         st.subheader("Projeção Financeira (Payback) – 25 anos")
         
@@ -613,42 +738,75 @@ def renderizar_projecao_financeira(
             ano_inicio_projeto=ano_inicio_projeto,
             inflacao_energia=inflacao_energia,
             degradacao_anual=DEGRADACAO_PAINEL_ANUAL,
-            kwh_minimo_disponibilidade=kwh_minimo_disponibilidade
+            kwh_minimo_disponibilidade=kwh_minimo_disponibilidade,
+            taxa_iluminacao_publica=taxa_iluminacao_publica # (R2)
         )
 
         fig = go.Figure()
         
+        # Linha 1: Gasto sem solar
         fig.add_trace(go.Scatter(
             x=df_plot["Ano"],
             y=df_plot["Gasto acumulado sem solar (R$)"],
+            customdata=df_plot["Gasto Formatado"], # (R11)
             mode="lines",
             name="Gasto Acumulado SEM Solar",
             line=dict(color="#D9534F", width=2, dash="dot"),
-            fill='tozeroy'
+            fill='tozeroy',
+            hovertemplate="<b>Ano %{x}</b><br>Gasto Acumulado: <b>%{customdata}</b><extra></extra>"
         ))
         
+        # Linha 2: Economia com solar
         fig.add_trace(go.Scatter(
             x=df_plot["Ano"],
             y=df_plot["Fluxo de caixa acumulado com solar (R$)"],
+            customdata=df_plot["Fluxo Formatado"], # (R11)
             mode="lines",
             name="Economia Acumulada COM Solar",
             line=dict(color=COR_PRIMARIA, width=4),
-            fill='tozeroy'
+            fill='tozeroy',
+            hovertemplate="<b>Ano %{x}</b><br>Economia Acumulada: <b>%{customdata}</b><extra></extra>"
         ))
         
         fig.add_hline(y=0, line_width=2, line_dash="dash", line_color="black")
         
-        payback_ano_str = "N/A"
+        # MUDANÇA (R10): Cálculo do Payback em Meses
+        payback_ano_str = "+ 25 anos"
         try:
-            payback_ano_num = df_plot[df_plot["Fluxo de caixa acumulado com solar (R$)"] > 0]["Ano"].iloc[0]
-            payback_ano_str = f"Ano {payback_ano_num}"
-        except IndexError:
-            payback_ano_str = "+ 25 anos"
+            anos_positivos_df = df_plot[df_plot["Fluxo de caixa acumulado com solar (R$)"] > 0]
+            if not anos_positivos_df.empty:
+                payback_ano_num = anos_positivos_df["Ano"].iloc[0]
+                
+                if payback_ano_num == 1:
+                    valor_inicial = -valor_final_investimento
+                    valor_final_ano_1 = anos_positivos_df["Fluxo de caixa acumulado com solar (R$)"].iloc[0]
+                    ganho_no_ano = valor_final_ano_1 - valor_inicial
+                    
+                    if ganho_no_ano > 0:
+                        fracao_ano = abs(valor_inicial) / ganho_no_ano
+                        total_meses = max(1, int(round(fracao_ano * 12)))
+                        payback_ano_str = f"~ {total_meses} meses"
+                    else:
+                        payback_ano_str = "Ano 1"
+                else:
+                    valor_final_ano_anterior = df_plot[df_plot["Ano"] == payback_ano_num - 1]["Fluxo de caixa acumulado com solar (R$)"].iloc[0]
+                    valor_final_ano_atual = anos_positivos_df["Fluxo de caixa acumulado com solar (R$)"].iloc[0]
+                    ganho_no_ano = valor_final_ano_atual - valor_final_ano_anterior
+                    
+                    if ganho_no_ano > 0:
+                        fracao_ano = abs(valor_final_ano_anterior) / ganho_no_ano
+                        meses_adicionais = int(round(fracao_ano * 12))
+                        total_meses = int((payback_ano_num - 1) * 12 + meses_adicionais)
+                        payback_ano_str = f"~ {total_meses} meses"
+                    else:
+                        payback_ano_str = f"Ano {payback_ano_num}"
+        except Exception:
+             pass
 
         fig.update_layout(
             title="Projeção: Gasto Acumulado vs. Economia Acumulada",
             xaxis_title="Ano",
-            yaxis_title="R$",
+            yaxis_title="Reais (R$)",
             template="plotly_white",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
@@ -656,50 +814,101 @@ def renderizar_projecao_financeira(
         
         economia_25_anos = df_plot["Fluxo de caixa acumulado com solar (R$)"].iloc[-1]
         
+        # MUDANÇA (R8): Usa Markdown para fontes menores
         st.markdown("---")
-        st.markdown("<h4 style='text-align: center;'>Resumo da Projeção</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='text-align: center; margin-bottom: 0px;'>Resumo da Projeção</h4>", unsafe_allow_html=True)
+        
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Investimento Inicial", f"R$ {valor_final_investimento:,.2f}")
+            st.markdown(f"""
+            <div class="metric-container-markdown" style="text-align: center;">
+                <h4>Investimento Inicial</h4>
+                <h3>{format_currency_brl(valor_final_investimento)}</h3>
+            </div>
+            """, unsafe_allow_html=True)
         with col2:
-            st.metric("Payback Estimado", payback_ano_str)
+            st.markdown(f"""
+            <div class="metric-container-markdown" style="text-align: center;">
+                <h4>Payback Estimado</h4>
+                <h3>{payback_ano_str}</h3>
+            </div>
+            """, unsafe_allow_html=True)
         with col3:
-            st.metric("Economia Líquida em 25 Anos", f"R$ {economia_25_anos:,.2f}")
+            st.markdown(f"""
+            <div class="metric-container-markdown" style="text-align: center;">
+                <h4>Economia em 25 Anos</h4>
+                <h3>{format_currency_brl(economia_25_anos)}</h3>
+            </div>
+            """, unsafe_allow_html=True)
 
         return {
-            "economia_25_anos": economia_25_anos
+            "economia_25_anos": economia_25_anos,
+            "payback_str": payback_ano_str # Passa o payback
         }
 
 def renderizar_exportar_proposta(dados_pdf: Dict[str, Any]):
-    """Adiciona os novos custos ao texto do WhatsApp."""
+    """MUDANÇA (R7, R12): Validação de dados e melhor CTA."""
     with st.container(border=True):
         st.subheader("Finalizar Proposta")
 
-        nova_fatura_minima = dados_pdf['custo_disponibilidade_mensal'] + dados_pdf['custo_fio_b_mensal']
+        # MUDANÇA (R7): Validação
+        dados_completos = True
+        modalidade = dados_pdf.get('modalidade')
         
-        texto_whats = (
-            f"Olá! Gostaria de um orçamento da Brasil Enertech.\n\n"
-            f"Simulei uma proposta no site para o cliente: {dados_pdf['cliente']}\n"
-            f"--- DADOS DA SIMULAÇÃO (ANO 1) ---\n"
-            f"- Tipo de Conexão: {dados_pdf['tipo_conexao']}\n"
-            f"- Consumo Alvo: {dados_pdf['kwh_mensal']:.0f} kWh\n"
-            f"- Autoconsumo: {dados_pdf['autoconsumo_percent']:.0f}%\n"
-            f"- Potência do sistema: {dados_pdf['kwp_total']:.2f} kWp\n"
-            f"- Geração mensal: {dados_pdf['geracao_mensal']:,.0f} kWh\n"
-            f"- Valor final: R$ {dados_pdf['valor_final']:,.2f}\n"
-            f"- Modalidade: {dados_pdf['modalidade']}\n"
-            f"- Economia líquida mensal: R$ {dados_pdf['economia_mensal']:,.2f}\n"
-            f"- Nova Fatura Mínima (Disp. + Fio B): R$ {nova_fatura_minima:,.2f}\n\n"
-            "Podemos validar esta proposta?"
-        )
-        link_whats = f"https://wa.me/5582998098501?text={quote(texto_whats)}"
+        if modalidade == "Financiamento":
+            tipo_cliente = st.session_state.get("tipo_cliente_fin", "Pessoa Física (PF)")
+            if tipo_cliente == "Pessoa Física (PF)":
+                if not st.session_state.get("dado_financeiro_pf") or not st.session_state.get("endereco_pf"):
+                    dados_completos = False
+                    msg_erro = "Preencha os campos de CPF e Endereço na seção 'Modalidades de Pagamento' para prosseguir."
+            else: # PJ
+                if not st.session_state.get("dado_financeiro_pj") or not st.session_state.get("endereco_pj"):
+                    dados_completos = False
+                    msg_erro = "Preencha os campos de CNPJ e Endereço na seção 'Modalidades de Pagamento' para prosseguir."
         
-        st.link_button(
-            "📲 Receber Proposta Detalhada no WhatsApp!",
-            link_whats,
-            type="primary", 
-            use_container_width=True
-        )
+        if not dados_completos:
+            st.warning(f"⚠️ {msg_erro}")
+            st.button("✅ Solicitar Visita Técnica pelo WhatsApp!", disabled=True, use_container_width=True)
+        else:
+            # Dados estão completos, renderiza o botão real
+            nova_fatura_minima = dados_pdf['custo_disponibilidade_mensal'] + dados_pdf['custo_fio_b_mensal'] + dados_pdf['taxa_iluminacao_publica']
+            
+            # Adiciona dados financeiros ao texto do WhatsApp
+            dados_fin_str = ""
+            if modalidade == "Financiamento":
+                dados_fin = dados_pdf['dados_cliente_fin']
+                if "cpf" in dados_fin:
+                    dados_fin_str = f"\n--- DADOS P/ ANÁLISE (PF) ---\nCPF: {dados_fin['cpf']}\nNasc: {dados_fin['data_nasc']}\nEnd: {dados_fin['endereco']}"
+                elif "cnpj" in dados_fin:
+                    dados_fin_str = f"\n--- DADOS P/ ANÁLISE (PJ) ---\nCNPJ: {dados_fin['cnpj']}\nAbertura: {dados_fin['data_abertura']}\nEnd: {dados_fin['endereco']}\nRamo: {dados_fin['ramo']}"
+
+            
+            texto_whats = (
+                f"Olá! Usei o simulador Brasil Enertech e gostaria de validar minha proposta.\n\n"
+                f"--- RESUMO DA SIMULAÇÃO (ANO 1) ---\n"
+                f"Cliente: {dados_pdf['cliente']}\n"
+                f"Telefone: {dados_pdf['telefone']}\n"
+                f"Conexão: {dados_pdf['tipo_conexao']}\n"
+                f"Consumo: {dados_pdf['kwh_mensal']:.0f} kWh\n"
+                f"Autoconsumo: {dados_pdf['autoconsumo_percent']:.0f}%\n"
+                f"Sistema: {dados_pdf['kwp_total']:.2f} kWp ({dados_pdf['qtd_paineis']} x {dados_pdf['pot_painel_w']} W)\n"
+                f"Valor Final: {format_currency_brl(dados_pdf['valor_final'])} ({dados_pdf['modalidade']})\n"
+                f"--- FINANCEIRO (MÊS) ---\n"
+                f"Economia Líquida: {format_currency_brl(dados_pdf['economia_mensal'])}\n"
+                f"Nova Fatura Estimada: {format_currency_brl(nova_fatura_minima)}\n"
+                f"Payback: {dados_pdf['payback_str']}\n"
+                f"{dados_fin_str}\n\n"
+                "Podemos agendar uma visita técnica?"
+            )
+            link_whats = f"https://wa.me/5582998098501?text={quote(texto_whats)}"
+            
+            # MUDANÇA (R12): Chamada para ação
+            st.link_button(
+                "✅ Solicitar Visita Técnica pelo WhatsApp!",
+                link_whats,
+                type="primary", 
+                use_container_width=True
+            )
 
 
 # ============================
@@ -712,7 +921,7 @@ def main():
         page_icon="☀️"
     )
     
-    # Inicializa os keys dos sliders
+    # Inicializa o state do slider
     if "autoconsumo_slider_1" not in st.session_state:
         st.session_state.autoconsumo_slider_1 = 40 # Valor padrão
     if "autoconsumo_slider_2" not in st.session_state:
@@ -725,6 +934,7 @@ def main():
     # 1. Coletar dados do cliente
     inputs_cliente = renderizar_entradas_cliente()
     kwh_minimo_disponibilidade = MINIMO_KWH_MAP.get(inputs_cliente["tipo_conexao"], 100)
+    taxa_iluminacao_publica = inputs_cliente["taxa_iluminacao_publica"] # (R2)
 
     # 2. Coletar dados técnicos
     inputs_tecnicos = renderizar_configuracoes_tecnicas()
@@ -745,13 +955,15 @@ def main():
         fracao_fio_b_percent=inputs_tecnicos["fracao_fio_b_percent"],
         ano_inicio_projeto=inputs_tecnicos["ano_inicio_projeto"],
         kwh_mensal_consumo=inputs_cliente["kwh_mensal"],
-        kwh_minimo_disponibilidade=kwh_minimo_disponibilidade
+        kwh_minimo_disponibilidade=kwh_minimo_disponibilidade,
+        taxa_iluminacao_publica=taxa_iluminacao_publica # (R2)
     )
     autoconsumo_atualizado = resultados_eco["autoconsumo_percent"]
 
     # 5. Calcular pagamento
     resultados_pag = renderizar_pagamento(
-        valor_sistema_base=resultados_dim["valor_sistema_base"]
+        valor_sistema_base=resultados_dim["valor_sistema_base"],
+        resultados_eco=resultados_eco
     )
 
     # 6. Calcular projeção financeira (25 anos)
@@ -763,7 +975,8 @@ def main():
         autoconsumo_percent=autoconsumo_atualizado,
         fracao_fio_b_percent=inputs_tecnicos["fracao_fio_b_percent"],
         ano_inicio_projeto=inputs_tecnicos["ano_inicio_projeto"],
-        kwh_minimo_disponibilidade=kwh_minimo_disponibilidade
+        kwh_minimo_disponibilidade=kwh_minimo_disponibilidade,
+        taxa_iluminacao_publica=taxa_iluminacao_publica # (R2)
     )
 
     # 7. Preparar dados e renderizar exportação
@@ -780,15 +993,7 @@ def main():
 
     renderizar_exportar_proposta(dados_pdf_final)
     
-    with st.expander("Opção de Administrador: Gerar PDF de Backup"):
-        pdf_bytes = gerar_pdf_proposta(dados_pdf_final)
-        st.download_button(
-            label="📄 Gerar PDF (Backup)",
-            data=pdf_bytes,
-            file_name=f"Proposta_Brasil_Enertech_{dados_pdf_final['cliente']}.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
+    # MUDANÇA (R5): PDF Backup REMOVIDO
 
 if __name__ == "__main__":
     main()
